@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   ci:
-    uses: dekopon-agents/provider-workflows/.github/workflows/ci.yml@SHARED_SHA # v1
+    uses: dekopon-agents/provider-workflows/.github/workflows/ci.yml@SHARED_SHA # vN
 ```
 
 `.github/workflows/release.yml`:
@@ -43,7 +43,7 @@ concurrency:
 
 jobs:
   release:
-    uses: dekopon-agents/provider-workflows/.github/workflows/release.yml@SHARED_SHA # v1
+    uses: dekopon-agents/provider-workflows/.github/workflows/release.yml@SHARED_SHA # vN
     permissions:
       contents: write
       id-token: write
@@ -66,7 +66,7 @@ on:
 
 jobs:
   cut:
-    uses: dekopon-agents/provider-workflows/.github/workflows/cut-release.yml@SHARED_SHA # v1
+    uses: dekopon-agents/provider-workflows/.github/workflows/cut-release.yml@SHARED_SHA # vN
     permissions:
       contents: write
     with:
@@ -74,9 +74,9 @@ jobs:
     secrets: inherit
 ```
 
-`SHARED_SHA` is a commit of this repository — pin to a commit; Dependabot bumps it. The trailing
-`# vN` comment is what lets Dependabot recognize the pin, so keep it and keep a `vN` tag on the
-commit. Add `.github/dependabot.yml` (`github-actions`, `/`, weekly) alongside.
+`SHARED_SHA` is a commit of this repository — pin to a commit; Dependabot bumps it. `vN` is the tag
+on that commit, and the trailing comment is what lets Dependabot recognize the pin, so keep both.
+Add `.github/dependabot.yml` (`github-actions`, `/`, weekly) alongside.
 
 ## The provider's half of the contract
 
