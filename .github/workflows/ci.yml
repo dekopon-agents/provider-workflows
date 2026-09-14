@@ -238,7 +238,7 @@ jobs:
             | jq -er --arg p "$PKG" '.packages[] | select(.name == $p) | .manifest_path')
           SOURCE_DATE_EPOCH=0 cargo cyclonedx --format json --spec-version 1.5 --all \
             --target wasm32-unknown-unknown --manifest-path "$manifest" \
-            --override-filename "${ASSET%.wasm}"
+            --override-filename "${SBOM%.json}"
           out="$(dirname "$manifest")/$SBOM"
           [[ "$out" -ef "$SBOM" ]] || mv "$out" "$SBOM"
           test -s "$SBOM"
