@@ -265,14 +265,14 @@ jobs:
               echo "error: a component with host imports instantiated under an empty linker" >&2
               exit 1
             fi
-            while IFS= read -r import; do
-              grep -F -- "$import" refusal.err >/dev/null || {
-                echo "error: refusal did not name import $import" >&2
-                cat refusal.err >&2
-                exit 1
-              }
-            done <component-imports.txt
-            echo "refused as expected: $(tr '\n' ' ' <component-imports.txt)"
+            # wasmtime reports only the first unresolved import, so the refusal must name at
+            # least one declared import, not all of them (openobserve imports http and clock).
+            grep -F -f component-imports.txt refusal.err >/dev/null || {
+              echo "error: refusal did not name any declared import" >&2
+              cat refusal.err >&2
+              exit 1
+            }
+            echo "refused as expected; declared imports: $(tr '\n' ' ' <component-imports.txt)"
           fi
 
       - name: Build the test suite
