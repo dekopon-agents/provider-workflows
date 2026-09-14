@@ -1,0 +1,272 @@
+name: Provider CI
+
+on:
+  workflow_call:
+
+env:
+  # Prebuilt x86_64-linux release tarballs. Bump here and in release.yml together.
+  WASM_TOOLS_VERSION: "1.259.0"
+  WASM_TOOLS_SHA256: "3e9b374b4c7715b771b69bf0d65a337990ed4546ec5e97e01c0ff587dfc52160"
+  WASMTIME_VERSION: "48.0.2"
+  WASMTIME_SHA256: "f2b0ad1ce9253f2f9a38793c2c42cd1cba4e90b27dc40d685eaf723dc8438d94"
+  CARGO_DENY_VERSION: "0.20.2"
+  CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+  CARGO_CYCLONEDX_VERSION: "0.5.9"
+  CARGO_CYCLONEDX_SHA256: "fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Name the provider from the repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=${GITHUB_REPOSITORY#dekopon-agents/dekopon-provider-}
+          [[ "$name" != "$GITHUB_REPOSITORY" ]]
+          {
+            echo "PROVIDER_NAME=$name"
+            echo "PKG=dekopon-$name-provider"
+            echo "ASSET=$name-provider.wasm"
+            echo "SBOM=$name-provider.cdx.json"
+          } >>"$GITHUB_ENV"
+
+      - name: Check out the provider
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: source-a
+          persist-credentials: false
+
+      - name: Check out provider-workflows at this workflow's commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: dekopon-agents/provider-workflows
+          ref: ${{ job.workflow_sha }}
+          path: shared
+          persist-credentials: false
+
+      - name: Install the Rust toolchain rust-toolchain.toml declares
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show
+          rustc --version --verbose
+          # rust-cache and any cargo run outside source-a must see the same toolchain.
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml | head -1)
+          test -n "$channel"
+          echo "RUSTUP_TOOLCHAIN=$channel" >>"$GITHUB_ENV"
+
+      - name: Install prebuilt tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch_tool() {
+            local tool=$1 url=$2 sha=$3 dir="$RUNNER_TEMP/tools/$1"
+            mkdir -p "$dir"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              "$url" --output "$RUNNER_TEMP/$tool.archive"
+            echo "$sha  $RUNNER_TEMP/$tool.archive" | sha256sum --check --strict
+            tar --extract --file "$RUNNER_TEMP/$tool.archive" --directory "$dir" --strip-components 1
+            echo "$dir" >>"$GITHUB_PATH"
+          }
+          fetch_tool wasm-tools \
+            "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz" \
+            "$WASM_TOOLS_SHA256"
+          fetch_tool wasmtime \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
+            "$WASMTIME_SHA256"
+          fetch_tool cargo-deny \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            "$CARGO_DENY_SHA256"
+          fetch_tool cargo-cyclonedx \
+            "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-${CARGO_CYCLONEDX_VERSION}/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz" \
+            "$CARGO_CYCLONEDX_SHA256"
+          export PATH="$RUNNER_TEMP/tools/wasm-tools:$RUNNER_TEMP/tools/wasmtime:$RUNNER_TEMP/tools/cargo-deny:$RUNNER_TEMP/tools/cargo-cyclonedx:$PATH"
+          wasm-tools --version
+          wasmtime --version
+          cargo deny --version
+          cargo cyclonedx --version
+
+      - name: Restore the cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: source-a
+          key: ${{ hashFiles('source-a/rust-toolchain.toml', 'source-a/rustflags') }}
+
+      - name: Check formatting
+        working-directory: source-a
+        run: cargo fmt --all --check
+
+      - name: Check dependency policy
+        working-directory: source-a
+        run: cargo deny --all-features check bans licenses sources advisories
+
+      - name: Lint for the host
+        working-directory: source-a
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Lint for wasm32
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f rustflags ]]; then
+            export RUSTFLAGS="$(cat rustflags)"
+          fi
+          cargo clippy --locked --package "$PKG" --lib --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Check the WIT mirrors against the resolved SDK crates
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # wit/deps/*.wit are mirrors of files the dekopon-provider-* crates ship. Compare against
+          # the exact sources Cargo resolved, offline. A mirror with no upstream, or a differing
+          # upstream, fails: the component would mismatch the host it loads into.
+          mapfile -t crate_dirs < <(
+            cargo metadata --locked --format-version 1 \
+              | jq -r '.packages[] | select(.name | startswith("dekopon-provider-")) | .manifest_path' \
+              | xargs -n1 dirname
+          )
+          for mirror in wit/deps/*.wit; do
+            base=$(basename "$mirror")
+            matched=0
+            for dir in "${crate_dirs[@]}"; do
+              while IFS= read -r upstream; do
+                cmp "$upstream" "$mirror"
+                matched=$((matched + 1))
+              done < <(find "$dir/wit" -name "$base" 2>/dev/null)
+            done
+            if [[ "$matched" -eq 0 ]]; then
+              echo "error: $mirror has no upstream in the resolved dekopon-provider-* crates" >&2
+              exit 1
+            fi
+            echo "$mirror matches $matched upstream copy(s)"
+          done
+
+      - name: Build the component
+        working-directory: source-a
+        run: ../shared/build.sh
+
+      - name: Verify the checksum sidecar and publish the component path to the tests
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict "$ASSET.sha256"
+          echo "DEKOPON_PROVIDER_COMPONENT=$PWD/$ASSET" >>"$GITHUB_ENV"
+
+      - name: Inspect the component
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          core="target/wasm32-unknown-unknown/release/${PKG//-/_}.wasm"
+          test -s "$core"
+          wasm-tools validate "$core"
+          wasm-tools validate "$ASSET"
+          wasm-tools component wit "$ASSET" >component.wit
+          cat component.wit
+          # Every import is a dekopon host interface; wasi and anything else is an ambient
+          # authority nobody reviewed. Every provider exports the provider-cli world.
+          if grep -E '^\s*import ' component.wit | grep -Ev '^\s*import dekopon:'; then
+            echo "error: import outside the dekopon: namespace" >&2
+            exit 1
+          fi
+          if grep -Eq 'wasi:|resolve-command' component.wit; then
+            echo "error: component exposes an ambient import or the retired resolve-command export" >&2
+            exit 1
+          fi
+          for export in describe invoke run-command; do
+            grep -Eq "^\s*export $export:" component.wit || {
+              echo "error: missing export $export" >&2
+              exit 1
+            }
+          done
+          grep -E '^\s*import ' component.wit | sed -E 's/^\s*import ([^;]+);.*/\1/' >component-imports.txt || true
+          printf 'component: %s bytes, %s import(s)\n' "$(wc -c <"$ASSET" | tr -d ' ')" "$(wc -l <component-imports.txt | tr -d ' ')"
+
+      - name: Raw wasmtime smoke
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Outside the broker, with the pinned wasmtime. A component with no host imports must
+          # answer describe(); one with imports must refuse to instantiate and name each import.
+          if [[ ! -s component-imports.txt ]]; then
+            wasmtime run --invoke 'describe()' "$ASSET" >describe.out
+            test -s describe.out
+            head -c 400 describe.out
+            echo
+          else
+            if wasmtime run --invoke 'describe()' "$ASSET" >/dev/null 2>refusal.err; then
+              echo "error: a component with host imports instantiated under an empty linker" >&2
+              exit 1
+            fi
+            while IFS= read -r import; do
+              grep -F -- "$import" refusal.err >/dev/null || {
+                echo "error: refusal did not name import $import" >&2
+                cat refusal.err >&2
+                exit 1
+              }
+            done <component-imports.txt
+            echo "refused as expected: $(tr '\n' ' ' <component-imports.txt)"
+          fi
+
+      - name: Build the test suite
+        working-directory: source-a
+        run: cargo test --locked --workspace --no-run
+
+      - name: Run the test suite
+        working-directory: source-a
+        run: cargo test --locked --workspace
+
+      - name: Generate the SBOM
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-cyclonedx writes next to the manifest it is given; the provider package's
+          # manifest is the workspace root for every provider but openobserve.
+          manifest=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er --arg p "$PKG" '.packages[] | select(.name == $p) | .manifest_path')
+          SOURCE_DATE_EPOCH=0 cargo cyclonedx --format json --spec-version 1.5 --all \
+            --target wasm32-unknown-unknown --manifest-path "$manifest" \
+            --override-filename "${ASSET%.wasm}"
+          out="$(dirname "$manifest")/$SBOM"
+          [[ "$out" -ef "$SBOM" ]] || mv "$out" "$SBOM"
+          test -s "$SBOM"
+          jq -e '.bomFormat == "CycloneDX"' "$SBOM" >/dev/null
+
+      - name: Check out an independent copy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: source-b
+          persist-credentials: false
+
+      - name: Rebuild from the clean copy and compare bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # source-b was checked out after the cache action and has an empty target/. Equal bytes
+          # prove both determinism and that the cache changed nothing.
+          (cd source-b && ../shared/build.sh)
+          cmp "source-a/$ASSET" "source-b/$ASSET"
+          cmp "source-a/$ASSET.sha256" "source-b/$ASSET.sha256"
+
+      - name: Upload the component and SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.ASSET }}
+          path: |
+            source-a/${{ env.ASSET }}
+            source-a/${{ env.ASSET }}.sha256
+            source-a/${{ env.SBOM }}
+          if-no-files-found: error
+          retention-days: 14

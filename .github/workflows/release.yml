@@ -1,0 +1,677 @@
+name: Provider release
+
+on:
+  workflow_call:
+
+env:
+  # Prebuilt x86_64-linux release tarballs. Bump here and in ci.yml together.
+  WASM_TOOLS_VERSION: "1.259.0"
+  WASM_TOOLS_SHA256: "3e9b374b4c7715b771b69bf0d65a337990ed4546ec5e97e01c0ff587dfc52160"
+  WASMTIME_VERSION: "48.0.2"
+  WASMTIME_SHA256: "f2b0ad1ce9253f2f9a38793c2c42cd1cba4e90b27dc40d685eaf723dc8438d94"
+  CARGO_DENY_VERSION: "0.20.2"
+  CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+  CARGO_CYCLONEDX_VERSION: "0.5.9"
+  CARGO_CYCLONEDX_SHA256: "fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8"
+  ORAS_VERSION: "1.2.3"
+  ORAS_LINUX_AMD64_SHA256: "b4efc97a91f471f323f193ea4b4d63d8ff443ca3aab514151a30751330852827"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      name: ${{ steps.provider.outputs.name }}
+      asset: ${{ steps.provider.outputs.asset }}
+      sbom: ${{ steps.provider.outputs.sbom }}
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - name: Name the provider from the repository
+        id: provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=${GITHUB_REPOSITORY#dekopon-agents/dekopon-provider-}
+          [[ "$name" != "$GITHUB_REPOSITORY" ]]
+          {
+            echo "PROVIDER_NAME=$name"
+            echo "PKG=dekopon-$name-provider"
+            echo "ASSET=$name-provider.wasm"
+            echo "SBOM=$name-provider.cdx.json"
+          } >>"$GITHUB_ENV"
+          {
+            echo "name=$name"
+            echo "asset=$name-provider.wasm"
+            echo "sbom=$name-provider.cdx.json"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Check out the tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: source-a
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out provider-workflows at this workflow's commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: dekopon-agents/provider-workflows
+          ref: ${{ job.workflow_sha }}
+          path: shared
+          persist-credentials: false
+
+      - name: Install the Rust toolchain rust-toolchain.toml declares
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show
+          rustc --version --verbose
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml | head -1)
+          test -n "$channel"
+          echo "RUSTUP_TOOLCHAIN=$channel" >>"$GITHUB_ENV"
+
+      - name: Verify the tag, the package version, and main ancestry
+        id: tag
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: release tag must be v<major>.<minor>.<patch>[-<prerelease>]" >&2
+            exit 1
+          fi
+          prerelease=false
+          [[ "$tag" == *-* ]] && prerelease=true
+          # checkout resolves a tag to its commit; fetch the tag ref itself before checking its
+          # object type so an annotated remote tag is not mistaken for a lightweight local one.
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          if [[ "$(git cat-file -t "refs/tags/$tag")" != tag ]]; then
+            echo "error: $tag must be an annotated tag" >&2
+            exit 1
+          fi
+          head_sha=$(git rev-parse HEAD)
+          tag_sha=$(git rev-parse "refs/tags/$tag^{}")
+          if [[ "$head_sha" != "$GITHUB_SHA" || "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "error: checkout and $tag must both resolve to event SHA $GITHUB_SHA" >&2
+            exit 1
+          fi
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er --arg p "$PKG" '.packages[] | select(.name == $p) | .version')
+          if [[ "$tag" != "v$version" ]]; then
+            echo "error: tag $tag does not match $PKG version $version" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "error: release event SHA does not point into main" >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Install prebuilt tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch_tool() {
+            local tool=$1 url=$2 sha=$3 dir="$RUNNER_TEMP/tools/$1"
+            mkdir -p "$dir"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              "$url" --output "$RUNNER_TEMP/$tool.archive"
+            echo "$sha  $RUNNER_TEMP/$tool.archive" | sha256sum --check --strict
+            tar --extract --file "$RUNNER_TEMP/$tool.archive" --directory "$dir" --strip-components 1
+            echo "$dir" >>"$GITHUB_PATH"
+          }
+          fetch_tool wasm-tools \
+            "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz" \
+            "$WASM_TOOLS_SHA256"
+          fetch_tool wasmtime \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
+            "$WASMTIME_SHA256"
+          fetch_tool cargo-deny \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            "$CARGO_DENY_SHA256"
+          fetch_tool cargo-cyclonedx \
+            "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-${CARGO_CYCLONEDX_VERSION}/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz" \
+            "$CARGO_CYCLONEDX_SHA256"
+          export PATH="$RUNNER_TEMP/tools/wasm-tools:$RUNNER_TEMP/tools/wasmtime:$RUNNER_TEMP/tools/cargo-deny:$RUNNER_TEMP/tools/cargo-cyclonedx:$PATH"
+          wasm-tools --version
+          wasmtime --version
+          cargo deny --version
+          cargo cyclonedx --version
+
+      - name: Restore the cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: source-a
+          key: ${{ hashFiles('source-a/rust-toolchain.toml', 'source-a/rustflags') }}
+          # A tag run can read main's cache; a cache written under a tag ref is never read again.
+          save-if: false
+
+      - name: Check formatting
+        working-directory: source-a
+        run: cargo fmt --all --check
+
+      - name: Check dependency policy
+        working-directory: source-a
+        run: cargo deny --all-features check bans licenses sources advisories
+
+      - name: Lint for the host
+        working-directory: source-a
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Lint for wasm32
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f rustflags ]]; then
+            export RUSTFLAGS="$(cat rustflags)"
+          fi
+          cargo clippy --locked --package "$PKG" --lib --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Check the WIT mirrors against the resolved SDK crates
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mapfile -t crate_dirs < <(
+            cargo metadata --locked --format-version 1 \
+              | jq -r '.packages[] | select(.name | startswith("dekopon-provider-")) | .manifest_path' \
+              | xargs -n1 dirname
+          )
+          for mirror in wit/deps/*.wit; do
+            base=$(basename "$mirror")
+            matched=0
+            for dir in "${crate_dirs[@]}"; do
+              while IFS= read -r upstream; do
+                cmp "$upstream" "$mirror"
+                matched=$((matched + 1))
+              done < <(find "$dir/wit" -name "$base" 2>/dev/null)
+            done
+            if [[ "$matched" -eq 0 ]]; then
+              echo "error: $mirror has no upstream in the resolved dekopon-provider-* crates" >&2
+              exit 1
+            fi
+            echo "$mirror matches $matched upstream copy(s)"
+          done
+
+      - name: Build the component
+        working-directory: source-a
+        run: ../shared/build.sh
+
+      - name: Verify the checksum sidecar and publish the component path to the tests
+        id: digest
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict "$ASSET.sha256"
+          echo "DEKOPON_PROVIDER_COMPONENT=$PWD/$ASSET" >>"$GITHUB_ENV"
+          echo "sha256=$(awk '{print $1}' "$ASSET.sha256")" >>"$GITHUB_OUTPUT"
+
+      - name: Inspect the component
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          core="target/wasm32-unknown-unknown/release/${PKG//-/_}.wasm"
+          test -s "$core"
+          wasm-tools validate "$core"
+          wasm-tools validate "$ASSET"
+          wasm-tools component wit "$ASSET" >component.wit
+          cat component.wit
+          if grep -E '^\s*import ' component.wit | grep -Ev '^\s*import dekopon:'; then
+            echo "error: import outside the dekopon: namespace" >&2
+            exit 1
+          fi
+          if grep -Eq 'wasi:|resolve-command' component.wit; then
+            echo "error: component exposes an ambient import or the retired resolve-command export" >&2
+            exit 1
+          fi
+          for export in describe invoke run-command; do
+            grep -Eq "^\s*export $export:" component.wit || {
+              echo "error: missing export $export" >&2
+              exit 1
+            }
+          done
+          grep -E '^\s*import ' component.wit | sed -E 's/^\s*import ([^;]+);.*/\1/' >component-imports.txt || true
+          printf 'component: %s bytes, %s import(s)\n' "$(wc -c <"$ASSET" | tr -d ' ')" "$(wc -l <component-imports.txt | tr -d ' ')"
+
+      - name: Raw wasmtime smoke
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -s component-imports.txt ]]; then
+            wasmtime run --invoke 'describe()' "$ASSET" >describe.out
+            test -s describe.out
+            head -c 400 describe.out
+            echo
+          else
+            if wasmtime run --invoke 'describe()' "$ASSET" >/dev/null 2>refusal.err; then
+              echo "error: a component with host imports instantiated under an empty linker" >&2
+              exit 1
+            fi
+            while IFS= read -r import; do
+              grep -F -- "$import" refusal.err >/dev/null || {
+                echo "error: refusal did not name import $import" >&2
+                cat refusal.err >&2
+                exit 1
+              }
+            done <component-imports.txt
+            echo "refused as expected: $(tr '\n' ' ' <component-imports.txt)"
+          fi
+
+      - name: Build the test suite
+        working-directory: source-a
+        run: cargo test --locked --workspace --no-run
+
+      - name: Run the test suite
+        working-directory: source-a
+        run: cargo test --locked --workspace
+
+      - name: Generate the SBOM
+        working-directory: source-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er --arg p "$PKG" '.packages[] | select(.name == $p) | .manifest_path')
+          SOURCE_DATE_EPOCH=0 cargo cyclonedx --format json --spec-version 1.5 --all \
+            --target wasm32-unknown-unknown --manifest-path "$manifest" \
+            --override-filename "${ASSET%.wasm}"
+          out="$(dirname "$manifest")/$SBOM"
+          [[ "$out" -ef "$SBOM" ]] || mv "$out" "$SBOM"
+          test -s "$SBOM"
+          jq -e '.bomFormat == "CycloneDX"' "$SBOM" >/dev/null
+
+      - name: Check out an independent copy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: source-b
+          persist-credentials: false
+
+      - name: Rebuild from the clean copy and compare bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd source-b && ../shared/build.sh)
+          cmp "source-a/$ASSET" "source-b/$ASSET"
+          cmp "source-a/$ASSET.sha256" "source-b/$ASSET.sha256"
+
+      - name: Upload the verified release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-component
+          path: |
+            source-a/${{ env.ASSET }}
+            source-a/${{ env.ASSET }}.sha256
+            source-a/${{ env.SBOM }}
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      ASSET: ${{ needs.build.outputs.asset }}
+      SBOM: ${{ needs.build.outputs.sbom }}
+    steps:
+      - name: Download the verified artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-component
+          path: dist
+      - name: Verify the downloaded artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
+          (cd dist && sha256sum --check --strict "$ASSET.sha256")
+          test -s "dist/$SBOM"
+      - name: Attest the component and its SBOM
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/${{ needs.build.outputs.asset }}
+            dist/${{ needs.build.outputs.sbom }}
+
+  draft:
+    needs: [build, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      ASSET: ${{ needs.build.outputs.asset }}
+      SBOM: ${{ needs.build.outputs.sbom }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+    steps:
+      - name: Download the verified artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-component
+          path: dist
+      - name: Verify the downloaded artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
+          (cd dist && sha256sum --check --strict "$ASSET.sha256")
+          test -s "dist/$SBOM"
+      - name: Inspect existing release state
+        id: release-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            | jq 'add' >"$RUNNER_TEMP/releases.json"
+          count=$(jq --arg tag "$GITHUB_REF_NAME" \
+            '[.[] | select(.tag_name == $tag)] | length' "$RUNNER_TEMP/releases.json")
+          case "$count" in
+            0) echo "mode=create" >>"$GITHUB_OUTPUT" ;;
+            1)
+              draft=$(jq -r --arg tag "$GITHUB_REF_NAME" \
+                '.[] | select(.tag_name == $tag) | .draft' "$RUNNER_TEMP/releases.json")
+              if [[ "$draft" != true ]]; then
+                echo "error: an already-published release exists for $GITHUB_REF_NAME" >&2
+                exit 1
+              fi
+              echo "mode=reuse" >>"$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "error: multiple releases unexpectedly use $GITHUB_REF_NAME" >&2
+              exit 1
+              ;;
+          esac
+      - name: Create the draft release
+        if: steps.release-state.outputs.mode == 'create'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=(--verify-tag --draft --title "$GITHUB_REF_NAME" --generate-notes)
+          [[ "$PRERELEASE" == true ]] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" \
+            "dist/$ASSET" "dist/$ASSET.sha256" "dist/$SBOM"
+      - name: Verify the exact draft assets and bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `gh release create` returns before the release list is consistent, so the draft this
+          # job just made can be absent from the very next `GET /releases`. openobserve's first
+          # release lost that race and the cleanup step deleted a draft that was fine. Poll.
+          count=0
+          for attempt in $(seq 1 20); do
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq 'add' >"$RUNNER_TEMP/releases.json"
+            count=$(jq --arg tag "$GITHUB_REF_NAME" \
+              '[.[] | select(.tag_name == $tag)] | length' "$RUNNER_TEMP/releases.json")
+            if [[ "$count" != 0 ]]; then
+              break
+            fi
+            echo "attempt $attempt: $GITHUB_REF_NAME is not in the release list yet"
+            sleep 3
+          done
+          if [[ "$count" != 1 ]]; then
+            echo "error: expected exactly one release for $GITHUB_REF_NAME, found $count" >&2
+            exit 1
+          fi
+          release_id=$(jq -r --arg tag "$GITHUB_REF_NAME" \
+            '.[] | select(.tag_name == $tag) | .id' "$RUNNER_TEMP/releases.json")
+          test -n "$release_id"
+          [[ "$(jq -r --arg tag "$GITHUB_REF_NAME" '.[] | select(.tag_name == $tag) | .draft' "$RUNNER_TEMP/releases.json")" == true ]]
+          [[ "$(jq -r --arg tag "$GITHUB_REF_NAME" '.[] | select(.tag_name == $tag) | .prerelease' "$RUNNER_TEMP/releases.json")" == "$PRERELEASE" ]]
+          assets=$(jq -r --arg tag "$GITHUB_REF_NAME" \
+            '.[] | select(.tag_name == $tag) | .assets[].name' "$RUNNER_TEMP/releases.json" | LC_ALL=C sort)
+          expected=$(printf '%s\n' "$ASSET" "$ASSET.sha256" "$SBOM" | LC_ALL=C sort)
+          [[ "$assets" == "$expected" ]]
+          mkdir "$RUNNER_TEMP/release-assets"
+          for name in "$ASSET" "$ASSET.sha256" "$SBOM"; do
+            asset_id=$(jq -r --arg tag "$GITHUB_REF_NAME" --arg name "$name" \
+              '.[] | select(.tag_name == $tag) | .assets[] | select(.name == $name) | .id' \
+              "$RUNNER_TEMP/releases.json")
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              >"$RUNNER_TEMP/release-assets/$name"
+          done
+          (cd "$RUNNER_TEMP/release-assets" && sha256sum --check --strict "$ASSET.sha256")
+          for name in "$ASSET" "$ASSET.sha256" "$SBOM"; do
+            cmp "dist/$name" "$RUNNER_TEMP/release-assets/$name"
+          done
+      - name: Remove only a newly created failed draft
+        if: failure() && steps.release-state.outputs.mode == 'create'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -o pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            | jq 'add' >"$RUNNER_TEMP/cleanup.json" || exit 0
+          release_id=$(jq -r --arg tag "$GITHUB_REF_NAME" \
+            '.[] | select(.tag_name == $tag and .draft == true) | .id' \
+            "$RUNNER_TEMP/cleanup.json")
+          if [[ -n "$release_id" ]]; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id" || true
+          fi
+
+  ghcr:
+    needs: [build, draft]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ASSET: ${{ needs.build.outputs.asset }}
+    steps:
+      - name: Download the verified artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-component
+          path: dist
+      - name: Verify the downloaded artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
+          (cd dist && sha256sum --check --strict "$ASSET.sha256")
+      - name: Authenticate to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install pinned ORAS
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}" \
+            --output "$RUNNER_TEMP/$archive"
+          echo "$ORAS_LINUX_AMD64_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" oras
+          install -m 0755 "$RUNNER_TEMP/oras" "$RUNNER_TEMP/bin-oras"
+      - name: Publish and verify the identical component layer
+        env:
+          NAME: ${{ needs.build.outputs.name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/dekopon-agents/provider-$NAME:$VERSION"
+          "$RUNNER_TEMP/bin-oras" push "$ref" \
+            --artifact-type application/vnd.dekopon.provider.v1+wasm \
+            "dist/$ASSET:application/wasm"
+          expected="sha256:$(awk '{print $1}' "dist/$ASSET.sha256")"
+          "$RUNNER_TEMP/bin-oras" manifest fetch "$ref" >"$RUNNER_TEMP/manifest.json"
+          jq -e --arg expected "$expected" '
+            (.layers | length) == 1 and
+            (.layers[0].digest == $expected) and
+            (.layers[0].mediaType == "application/wasm")
+          ' "$RUNNER_TEMP/manifest.json" >/dev/null
+
+  finalize:
+    needs: [build, ghcr]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      ASSET: ${{ needs.build.outputs.asset }}
+      SBOM: ${{ needs.build.outputs.sbom }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+    steps:
+      - name: Download the verified artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-component
+          path: dist
+      - name: Verify the draft and its exact assets before publication
+        id: draft-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check --strict "$ASSET.sha256")
+          count=0
+          for attempt in $(seq 1 20); do
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq 'add' >"$RUNNER_TEMP/releases.json"
+            count=$(jq --arg tag "$GITHUB_REF_NAME" \
+              '[.[] | select(.tag_name == $tag)] | length' "$RUNNER_TEMP/releases.json")
+            if [[ "$count" != 0 ]]; then
+              break
+            fi
+            echo "attempt $attempt: $GITHUB_REF_NAME is not in the release list yet"
+            sleep 3
+          done
+          if [[ "$count" != 1 ]]; then
+            echo "error: expected exactly one release for $GITHUB_REF_NAME, found $count" >&2
+            exit 1
+          fi
+          release_id=$(jq -r --arg tag "$GITHUB_REF_NAME" \
+            '.[] | select(.tag_name == $tag and .draft == true) | .id' \
+            "$RUNNER_TEMP/releases.json")
+          test -n "$release_id"
+          assets=$(jq -r --arg tag "$GITHUB_REF_NAME" \
+            '.[] | select(.tag_name == $tag) | .assets[].name' "$RUNNER_TEMP/releases.json" | LC_ALL=C sort)
+          expected=$(printf '%s\n' "$ASSET" "$ASSET.sha256" "$SBOM" | LC_ALL=C sort)
+          [[ "$assets" == "$expected" ]]
+          echo "release_id=$release_id" >>"$GITHUB_OUTPUT"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft-release.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make_latest=true
+          [[ "$PRERELEASE" == true ]] && make_latest=false
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -F "prerelease=$PRERELEASE" -f "make_latest=$make_latest" \
+            >"$RUNNER_TEMP/published.json"
+          test "$(jq -r .draft "$RUNNER_TEMP/published.json")" = false
+          test "$(jq -r .prerelease "$RUNNER_TEMP/published.json")" = "$PRERELEASE"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .draft)" = false
+
+  anonymous-verify:
+    needs: [build, finalize]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      ASSET: ${{ needs.build.outputs.asset }}
+      SBOM: ${{ needs.build.outputs.sbom }}
+      EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
+      # A private repository cannot be read anonymously; verify with the job token there and
+      # anonymously everywhere else. Same command either way.
+      REPO_PRIVATE: ${{ github.event.repository.private }}
+    steps:
+      - name: Download the published assets as the public sees them
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/public"
+          auth=()
+          [[ "$REPO_PRIVATE" == true ]] && auth=(--header "Authorization: Bearer $GH_TOKEN")
+          for name in "$ASSET" "$ASSET.sha256" "$SBOM"; do
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "${auth[@]}" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$name" \
+              --output "$RUNNER_TEMP/public/$name"
+          done
+          (cd "$RUNNER_TEMP/public" && sha256sum --check --strict "$ASSET.sha256")
+          actual=$(sha256sum "$RUNNER_TEMP/public/$ASSET" | awk '{print $1}')
+          [[ "$actual" == "$EXPECTED_SHA256" ]]
+      - name: Verify the attestations with no ambient credentials
+        shell: bash
+        env:
+          MAYBE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The bundle is fetched from the public attestations API and verified offline, so a
+          # leftover token cannot turn this into an authenticated check by accident.
+          auth=()
+          [[ "$REPO_PRIVATE" == true ]] && auth=(--header "Authorization: Bearer $MAYBE_TOKEN")
+          for name in "$ASSET" "$SBOM"; do
+            digest=$(sha256sum "$RUNNER_TEMP/public/$name" | awk '{print $1}')
+            found=0
+            for attempt in $(seq 1 20); do
+              if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "${auth[@]}" \
+                --header "Accept: application/vnd.github+json" \
+                --get --data-urlencode "predicate_type=https://slsa.dev/provenance/v1" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/attestations/sha256:$digest" \
+                --output "$RUNNER_TEMP/$name.attestations.json"; then
+                found=1
+                break
+              fi
+              echo "attempt $attempt: no attestation for $name yet"
+              sleep 6
+            done
+            [[ "$found" == 1 ]]
+            test "$(jq '.attestations | length' "$RUNNER_TEMP/$name.attestations.json")" -eq 1
+            jq '.attestations[0].bundle' "$RUNNER_TEMP/$name.attestations.json" >"$RUNNER_TEMP/$name.bundle.json"
+            env -u GH_TOKEN -u GITHUB_TOKEN -u MAYBE_TOKEN GH_CONFIG_DIR="$RUNNER_TEMP/gh-clean" \
+              gh attestation verify "$RUNNER_TEMP/public/$name" \
+                --bundle "$RUNNER_TEMP/$name.bundle.json" \
+                --repo "$GITHUB_REPOSITORY" \
+                --predicate-type https://slsa.dev/provenance/v1 \
+                --signer-workflow dekopon-agents/provider-workflows/.github/workflows/release.yml \
+                --source-ref "$GITHUB_REF" \
+                --source-digest "$GITHUB_SHA" \
+                --deny-self-hosted-runners \
+                --format json >"$RUNNER_TEMP/$name.verify.json"
+            jq -r '.[0].verificationResult.signature.certificate | {buildSignerURI, sourceRepositoryURI, sourceRepositoryDigest}' \
+              "$RUNNER_TEMP/$name.verify.json"
+          done

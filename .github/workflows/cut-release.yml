@@ -1,0 +1,111 @@
+name: Provider cut-release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version to release, without the v (1.2.3 or 1.2.3-rc.1)
+        type: string
+        required: true
+    secrets:
+      DEKOPON_RELEASE_APP_ID:
+        required: true
+      DEKOPON_RELEASE_APP_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  cut:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Validate the request
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: version must be <major>.<minor>.<patch>[-<prerelease>], got $VERSION" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "error: releases are cut from main, not $GITHUB_REF" >&2
+            exit 1
+          fi
+          name=${GITHUB_REPOSITORY#dekopon-agents/dekopon-provider-}
+          [[ "$name" != "$GITHUB_REPOSITORY" ]]
+          echo "PKG=dekopon-$name-provider" >>"$GITHUB_ENV"
+
+      # A tag pushed with GITHUB_TOKEN triggers nothing. The App's installation token is a
+      # different principal, so its push starts release.yml like a human push would.
+      - name: Mint a release token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DEKOPON_RELEASE_APP_ID }}
+          private-key: ${{ secrets.DEKOPON_RELEASE_APP_KEY }}
+
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.token.outputs.token }}
+
+      - name: Install the Rust toolchain rust-toolchain.toml declares
+        run: rustup show
+
+      - name: Refuse an existing tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "error: tag v$VERSION already exists" >&2
+            exit 1
+          fi
+
+      - name: Set the package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-edit follows `version.workspace = true` to [workspace.package], so one command
+          # covers openobserve's workspace and the single-crate providers alike.
+          cargo install cargo-edit --locked --version 0.13.13
+          cargo set-version --package "$PKG" "$VERSION"
+          cargo update --workspace
+          actual=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er --arg p "$PKG" '.packages[] | select(.name == $p) | .version')
+          [[ "$actual" == "$VERSION" ]]
+          git --no-pager diff --stat
+          # Only manifests and the lockfile may change, and the lockfile only in version lines.
+          changed=$(git diff --name-only)
+          while IFS= read -r file; do
+            case "$file" in
+              Cargo.toml|*/Cargo.toml|Cargo.lock) ;;
+              *) echo "error: unexpected change in $file" >&2; exit 1 ;;
+            esac
+          done <<<"$changed"
+          if git diff -U0 -- Cargo.lock | grep -E '^[+-]' | grep -Ev '^(\+\+\+|---)' | grep -Ev '^[+-](version|name) = '; then
+            echo "error: Cargo.lock changed beyond the provider's own version line" >&2
+            exit 1
+          fi
+
+      - name: Commit, tag, and push atomically
+        shell: bash
+        env:
+          APP_SLUG: ${{ steps.token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          # release.yml requires the tag to point into main; --atomic makes the commit and the
+          # tag land together or not at all.
+          git config user.name "$APP_SLUG[bot]"
+          git config user.email "$APP_SLUG[bot]@users.noreply.github.com"
+          git commit -am "Release v$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push --atomic origin "HEAD:refs/heads/main" "refs/tags/v$VERSION"
+          echo "pushed $(git rev-parse HEAD) and v$VERSION"
