@@ -128,7 +128,7 @@ jobs:
           shopt -s nullglob
           # Most wit/deps/*.wit files mirror published dekopon-provider-* crates. The single
           # broker-owned settings import is not in the published SDK: check its exact bytes
-          # against the core broker-host WIT pin instead. Unknown imports still fail below.
+          # against the core broker-host WIT pin instead. Ambient imports still fail below.
           mapfile -t crate_dirs < <(
             cargo metadata --locked --format-version 1 \
               | jq -r '.packages[] | select(.name | startswith("dekopon-provider-")) | .manifest_path' \
