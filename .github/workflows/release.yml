@@ -194,6 +194,13 @@ jobs:
           )
           for mirror in wit/deps/*.wit; do
             base=$(basename "$mirror")
+            # The project-owned settings import is pinned to the broker-host WIT; all other
+            # mirrors must still match the resolved published SDK crates below.
+            if [[ "$base" == "settings.wit" ]]; then
+              echo '3ac8c7849062bb84afe3300b7c025ac266f77f9ac60f2b237c9ebc0be1f189cf  '"$mirror" | sha256sum --check --status
+              echo "$mirror matches the broker-owned dekopon:settings/config@0.1.0 WIT pin"
+              continue
+            fi
             matched=0
             for dir in "${crate_dirs[@]}"; do
               while IFS= read -r upstream; do

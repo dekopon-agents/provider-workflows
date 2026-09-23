@@ -126,9 +126,9 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # wit/deps/*.wit are mirrors of files the dekopon-provider-* crates ship. Compare against
-          # the exact sources Cargo resolved, offline. A mirror with no upstream, or a differing
-          # upstream, fails: the component would mismatch the host it loads into.
+          # Most wit/deps/*.wit files mirror published dekopon-provider-* crates. The single
+          # broker-owned settings import is not in the published SDK: check its exact bytes
+          # against the core broker-host WIT pin instead. Ambient imports still fail below.
           mapfile -t crate_dirs < <(
             cargo metadata --locked --format-version 1 \
               | jq -r '.packages[] | select(.name | startswith("dekopon-provider-")) | .manifest_path' \
@@ -136,6 +136,11 @@ jobs:
           )
           for mirror in wit/deps/*.wit; do
             base=$(basename "$mirror")
+            if [[ "$base" == "settings.wit" ]]; then
+              echo '3ac8c7849062bb84afe3300b7c025ac266f77f9ac60f2b237c9ebc0be1f189cf  '"$mirror" | sha256sum --check --status
+              echo "$mirror matches the broker-owned dekopon:settings/config@0.1.0 WIT pin"
+              continue
+            fi
             matched=0
             for dir in "${crate_dirs[@]}"; do
               while IFS= read -r upstream; do
