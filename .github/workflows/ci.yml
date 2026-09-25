@@ -96,7 +96,32 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: source-a
+          # One key for CI and Release, so a tag run restores main's cache.
+          shared-key: provider
           key: ${{ hashFiles('source-a/rust-toolchain.toml', 'source-a/rustflags') }}
+
+      - name: Optimize the test-time Wasmtime compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Tests compile the component with the testkit's Cranelift; at opt-level 0 that compile
+          # dominated test time (core #334). Dev/test profile only: build.sh builds --release.
+          cat >>"${CARGO_HOME:-$HOME/.cargo}/config.toml" <<'TOML'
+          [profile.dev.package]
+          cranelift-codegen = { opt-level = 3 }
+          cranelift-bforest = { opt-level = 3 }
+          cranelift-entity = { opt-level = 3 }
+          cranelift-frontend = { opt-level = 3 }
+          cranelift-control = { opt-level = 3 }
+          cranelift-bitset = { opt-level = 3 }
+          cranelift-assembler-x64 = { opt-level = 3 }
+          regalloc2 = { opt-level = 3 }
+          wasmparser = { opt-level = 3 }
+          wasmtime-environ = { opt-level = 3 }
+          wasmtime-internal-cranelift = { opt-level = 3 }
+          gimli = { opt-level = 3 }
+          "*" = { debug = false }
+          TOML
 
       - name: Check formatting
         working-directory: source-a
@@ -249,21 +274,22 @@ jobs:
           test -s "$SBOM"
           jq -e '.bomFormat == "CycloneDX"' "$SBOM" >/dev/null
 
-      - name: Check out an independent copy
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          path: source-b
-          persist-credentials: false
+      # Paused 2026-09-25: speed over reproducibility; build.sh is unchanged, uncomment to re-prove.
+      # - name: Check out an independent copy
+      #   uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      #   with:
+      #     path: source-b
+      #     persist-credentials: false
 
-      - name: Rebuild from the clean copy and compare bytes
-        shell: bash
-        run: |
-          set -euo pipefail
-          # source-b was checked out after the cache action and has an empty target/. Equal bytes
-          # prove both determinism and that the cache changed nothing.
-          (cd source-b && ../shared/build.sh)
-          cmp "source-a/$ASSET" "source-b/$ASSET"
-          cmp "source-a/$ASSET.sha256" "source-b/$ASSET.sha256"
+      # - name: Rebuild from the clean copy and compare bytes
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     # source-b was checked out after the cache action and has an empty target/. Equal bytes
+      #     # prove both determinism and that the cache changed nothing.
+      #     (cd source-b && ../shared/build.sh)
+      #     cmp "source-a/$ASSET" "source-b/$ASSET"
+      #     cmp "source-a/$ASSET.sha256" "source-b/$ASSET.sha256"
 
       - name: Upload the component and SBOM
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

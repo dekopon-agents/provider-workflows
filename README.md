@@ -3,8 +3,9 @@
 The CI, release and cut-release workflows every Dekopon provider calls. A provider repository
 owns its source, its `Cargo.toml`, its `rust-toolchain.toml`, its `deny.toml` and its `wit/`
 mirrors; everything else — the toolchain install, the pinned tools, the caching, the lints, the
-reproducible component build, the component inspection, the SBOM, the release, the GHCR push and
-the anonymous attestation verification — lives here, once, and is pinned by SHA from each caller.
+reproducible component build (its CI byte-for-byte rebuild is paused for speed), the component
+inspection, the SBOM, the release, the GHCR push and the anonymous attestation verification —
+lives here, once, and is pinned by SHA from each caller.
 Dependabot bumps the pin when a new `vN` tag lands.
 
 ## Callers
