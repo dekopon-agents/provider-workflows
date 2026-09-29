@@ -1,12 +1,12 @@
 # provider-workflows
 
-The CI, release and cut-release workflows every Dekopon provider calls. A provider repository
+The CI and release workflows every Dekopon provider calls. A provider repository
 owns its source, its `Cargo.toml`, its `rust-toolchain.toml`, its `deny.toml` and its `wit/`
 mirrors; everything else — the toolchain install, the pinned tools, the caching, the lints, the
 reproducible component build (its CI byte-for-byte rebuild is paused for speed), the component
 inspection, the SBOM, the release, the GHCR push and the anonymous attestation verification —
-lives here, once, and is pinned by SHA from each caller.
-Dependabot bumps the pin when a new `vN` tag lands.
+lives here, once, and every caller tracks it at `@main`: a change to shared CI is one commit
+here.
 
 ## Callers
 
@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   ci:
-    uses: dekopon-agents/provider-workflows/.github/workflows/ci.yml@SHARED_SHA # vN
+    uses: dekopon-agents/provider-workflows/.github/workflows/ci.yml@main
 ```
 
 `.github/workflows/release.yml`:
@@ -44,7 +44,7 @@ concurrency:
 
 jobs:
   release:
-    uses: dekopon-agents/provider-workflows/.github/workflows/release.yml@SHARED_SHA # vN
+    uses: dekopon-agents/provider-workflows/.github/workflows/release.yml@main
     permissions:
       contents: write
       id-token: write
@@ -52,32 +52,8 @@ jobs:
       packages: write
 ```
 
-`.github/workflows/cut-release.yml`:
-
-```yaml
-name: Cut release
-
-on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: The version to release, without the v (1.2.3 or 1.2.3-rc.1)
-        type: string
-        required: true
-
-jobs:
-  cut:
-    uses: dekopon-agents/provider-workflows/.github/workflows/cut-release.yml@SHARED_SHA # vN
-    permissions:
-      contents: write
-    with:
-      version: ${{ inputs.version }}
-    secrets: inherit
-```
-
-`SHARED_SHA` is a commit of this repository — pin to a commit; Dependabot bumps it. `vN` is the tag
-on that commit, and the trailing comment is what lets Dependabot recognize the pin, so keep both.
-Add `.github/dependabot.yml` (`github-actions`, `/`, weekly) alongside.
+To release, commit the version bump to the provider's `main`, then push an annotated `vX.Y.Z` tag
+on that commit. The tag runs the release workflow.
 
 ## The provider's half of the contract
 
