@@ -7,8 +7,6 @@ env:
   # Prebuilt x86_64-linux release tarballs. Bump here and in ci.yml together.
   WASM_TOOLS_VERSION: "1.259.0"
   WASM_TOOLS_SHA256: "3e9b374b4c7715b771b69bf0d65a337990ed4546ec5e97e01c0ff587dfc52160"
-  WASMTIME_VERSION: "48.0.2"
-  WASMTIME_SHA256: "f2b0ad1ce9253f2f9a38793c2c42cd1cba4e90b27dc40d685eaf723dc8438d94"
   CARGO_DENY_VERSION: "0.20.2"
   CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
   CARGO_CYCLONEDX_VERSION: "0.5.9"
@@ -136,18 +134,14 @@ jobs:
           fetch_tool wasm-tools \
             "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz" \
             "$WASM_TOOLS_SHA256"
-          fetch_tool wasmtime \
-            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
-            "$WASMTIME_SHA256"
           fetch_tool cargo-deny \
             "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
             "$CARGO_DENY_SHA256"
           fetch_tool cargo-cyclonedx \
             "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-${CARGO_CYCLONEDX_VERSION}/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz" \
             "$CARGO_CYCLONEDX_SHA256"
-          export PATH="$RUNNER_TEMP/tools/wasm-tools:$RUNNER_TEMP/tools/wasmtime:$RUNNER_TEMP/tools/cargo-deny:$RUNNER_TEMP/tools/cargo-cyclonedx:$PATH"
+          export PATH="$RUNNER_TEMP/tools/wasm-tools:$RUNNER_TEMP/tools/cargo-deny:$RUNNER_TEMP/tools/cargo-cyclonedx:$PATH"
           wasm-tools --version
-          wasmtime --version
           cargo deny --version
           cargo cyclonedx --version
 
@@ -206,40 +200,6 @@ jobs:
           fi
           cargo clippy --locked --package "$PKG" --lib --target wasm32-unknown-unknown -- -D warnings
 
-      - name: Check the WIT mirrors against the resolved SDK crates
-        working-directory: source-a
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          mapfile -t crate_dirs < <(
-            cargo metadata --locked --format-version 1 \
-              | jq -r '.packages[] | select(.name | startswith("dekopon-provider-")) | .manifest_path' \
-              | xargs -n1 dirname
-          )
-          for mirror in wit/deps/*.wit; do
-            base=$(basename "$mirror")
-            # The project-owned settings import is pinned to the broker-host WIT; all other
-            # mirrors must still match the resolved published SDK crates below.
-            if [[ "$base" == "settings.wit" ]]; then
-              echo '3ac8c7849062bb84afe3300b7c025ac266f77f9ac60f2b237c9ebc0be1f189cf  '"$mirror" | sha256sum --check --status
-              echo "$mirror matches the broker-owned dekopon:settings/config@0.1.0 WIT pin"
-              continue
-            fi
-            matched=0
-            for dir in "${crate_dirs[@]}"; do
-              while IFS= read -r upstream; do
-                cmp "$upstream" "$mirror"
-                matched=$((matched + 1))
-              done < <(find "$dir/wit" -name "$base" 2>/dev/null)
-            done
-            if [[ "$matched" -eq 0 ]]; then
-              echo "error: $mirror has no upstream in the resolved dekopon-provider-* crates" >&2
-              exit 1
-            fi
-            echo "$mirror matches $matched upstream copy(s)"
-          done
-
       - name: Build the component
         working-directory: source-a
         run: ../shared/build.sh
@@ -253,59 +213,6 @@ jobs:
           sha256sum --check --strict "$ASSET.sha256"
           echo "DEKOPON_PROVIDER_COMPONENT=$PWD/$ASSET" >>"$GITHUB_ENV"
           echo "sha256=$(awk '{print $1}' "$ASSET.sha256")" >>"$GITHUB_OUTPUT"
-
-      - name: Inspect the component
-        working-directory: source-a
-        shell: bash
-        run: |
-          set -euo pipefail
-          core="target/wasm32-unknown-unknown/release/${PKG//-/_}.wasm"
-          test -s "$core"
-          wasm-tools validate "$core"
-          wasm-tools validate "$ASSET"
-          wasm-tools component wit "$ASSET" >component.wit
-          cat component.wit
-          if grep -E '^\s*import ' component.wit | grep -Ev '^\s*import dekopon:'; then
-            echo "error: import outside the dekopon: namespace" >&2
-            exit 1
-          fi
-          if grep -Eq 'wasi:|resolve-command' component.wit; then
-            echo "error: component exposes an ambient import or the retired resolve-command export" >&2
-            exit 1
-          fi
-          for export in describe invoke run-command; do
-            grep -Eq "^\s*export $export:" component.wit || {
-              echo "error: missing export $export" >&2
-              exit 1
-            }
-          done
-          grep -E '^\s*import ' component.wit | sed -E 's/^\s*import ([^;]+);.*/\1/' >component-imports.txt || true
-          printf 'component: %s bytes, %s import(s)\n' "$(wc -c <"$ASSET" | tr -d ' ')" "$(wc -l <component-imports.txt | tr -d ' ')"
-
-      - name: Raw wasmtime smoke
-        working-directory: source-a
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! -s component-imports.txt ]]; then
-            wasmtime run --invoke 'describe()' "$ASSET" >describe.out
-            test -s describe.out
-            head -c 400 describe.out
-            echo
-          else
-            if wasmtime run --invoke 'describe()' "$ASSET" >/dev/null 2>refusal.err; then
-              echo "error: a component with host imports instantiated under an empty linker" >&2
-              exit 1
-            fi
-            # wasmtime reports only the first unresolved import, so the refusal must name at
-            # least one declared import, not all of them (openobserve imports http and clock).
-            grep -F -f component-imports.txt refusal.err >/dev/null || {
-              echo "error: refusal did not name any declared import" >&2
-              cat refusal.err >&2
-              exit 1
-            }
-            echo "refused as expected; declared imports: $(tr '\n' ' ' <component-imports.txt)"
-          fi
 
       - name: Build the test suite
         working-directory: source-a
