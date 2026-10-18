@@ -1,6 +1,7 @@
 # provider-workflows
 
-The CI and release workflows every Dekopon provider calls. A provider repository
+The CI, release and cut-release workflows every Dekopon provider calls (cut-release also serves
+dekopon, dekopon-console, vm-runner and cm). A provider repository
 owns its source, its `Cargo.toml`, its `rust-toolchain.toml`, its `deny.toml` and its `wit/`
 mirrors; everything else — the toolchain install, the pinned tools, the caching, the lints, the
 reproducible component build (its CI byte-for-byte rebuild is paused for speed), the SBOM, the
@@ -51,8 +52,49 @@ jobs:
       packages: write
 ```
 
-To release, commit the version bump to the provider's `main`, then push an annotated `vX.Y.Z` tag
-on that commit. The tag runs the release workflow.
+`.github/workflows/cut-release.yml`:
+
+```yaml
+name: Cut release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: Space-separated tags to create on one commit
+        type: string
+        required: true
+      sha:
+        description: The commit on main to tag; empty means main's HEAD
+        type: string
+        default: ""
+      dry_run:
+        description: Check and create the tags without pushing them
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  cut:
+    uses: dekopon-agents/provider-workflows/.github/workflows/cut-release.yml@main
+    with:
+      tags: ${{ inputs.tags }}
+      sha: ${{ inputs.sha }}
+      package: dekopon-<name>-provider
+      dry_run: ${{ inputs.dry_run }}
+    secrets:
+      DEKOPON_RELEASE_APP_ID: ${{ secrets.DEKOPON_RELEASE_APP_ID }}
+      DEKOPON_RELEASE_APP_KEY: ${{ secrets.DEKOPON_RELEASE_APP_KEY }}
+```
+
+To release, merge the version bump to the provider's `main`, then dispatch Cut release with
+`tags: vX.Y.Z` (`gh workflow run cut-release.yml -f tags=vX.Y.Z -f dry_run=false`). It refuses a commit
+off `main`, an existing tag, or a tag whose version differs from `package`'s at that commit, then pushes
+an annotated tag as the dekopon-release App, whose push starts the release workflow (a `GITHUB_TOKEN`
+push would not). `require_head: true` additionally refuses anything but `main`'s HEAD. Pushing an
+annotated tag by hand still works.
 
 ## The provider's half of the contract
 

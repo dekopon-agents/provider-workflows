@@ -16,11 +16,11 @@ on:
         type: string
         default: ""
       require_head:
-        description: Refuse unless sha is main's HEAD (vm-runner's release workflows require it)
+        description: Refuse unless sha is main's HEAD (vm-runner's release workflows require it); a merge landing mid-run uses the tag up, so recovery is the next version
         type: boolean
         default: false
       dry_run:
-        description: Check and create the tags locally, push nothing
+        description: Check, tag locally and dry-run the push (proving the App may push); push nothing
         type: boolean
         default: true
     secrets:
@@ -31,10 +31,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: cut-release-${{ github.repository }}
-  cancel-in-progress: false
 
 jobs:
   cut:
@@ -77,19 +73,16 @@ jobs:
             echo "error: $sha is not main's HEAD $head" >&2
             exit 1
           fi
-          read -ra tags <<<"$TAGS"
+          read -ra tags <<<"${TAGS//$'\n'/ }"
           (( ${#tags[@]} > 0 )) || { echo "error: no tags given" >&2; exit 1; }
           git checkout -q --detach "$sha"
           for tag in "${tags[@]}"; do
-            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
-              echo "error: tag $tag already exists" >&2
-              exit 1
-            fi
             if [[ "$tag" =~ ^(v|cm-)($semver)$ ]]; then
               want=${BASH_REMATCH[2]}
               [[ -n "$PACKAGE" ]] || { echo "error: $tag needs the package input" >&2; exit 1; }
               have=$(RUSTUP_TOOLCHAIN=stable cargo metadata --no-deps --format-version 1 \
-                | jq -er --arg p "$PACKAGE" '.packages[] | select(.name == $p) | .version')
+                | jq -er --arg p "$PACKAGE" '.packages[] | select(.name == $p) | .version') \
+                || { echo "error: no package $PACKAGE at $sha" >&2; exit 1; }
             elif [[ "$tag" =~ ^dekopon-chart-($semver)$ ]]; then
               want=${BASH_REMATCH[1]}
               have=$(sed -n 's/^version:[[:space:]]*//p' charts/dekopon/Chart.yaml)
@@ -114,15 +107,15 @@ jobs:
           set -euo pipefail
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
-          read -ra tags <<<"$TAGS"
+          read -ra tags <<<"${TAGS//$'\n'/ }"
           refs=()
           for tag in "${tags[@]}"; do
             git tag -a "$tag" -m "$tag" "$SHA_RESOLVED"
-            [[ "$(git cat-file -t "$tag")" == tag ]]
             refs+=("refs/tags/$tag")
           done
           if [[ "$DRY_RUN" == true ]]; then
-            echo "dry run: would push ${tags[*]} at $SHA_RESOLVED"
+            git push --atomic --dry-run origin "${refs[@]}"
+            echo "dry run: the App may push ${tags[*]} at $SHA_RESOLVED"
             exit 0
           fi
           git push --atomic origin "${refs[@]}"
