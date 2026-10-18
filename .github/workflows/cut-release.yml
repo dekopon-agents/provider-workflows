@@ -1,0 +1,129 @@
+name: Cut release
+
+on:
+  workflow_call:
+    inputs:
+      tags:
+        description: Space-separated tags to create on one commit (v1.2.3, cm-1.2.3, dekopon-chart-1.2.3, guest-v1.2.3)
+        type: string
+        required: true
+      sha:
+        description: The commit on main to tag; empty means main's HEAD
+        type: string
+        default: ""
+      package:
+        description: The Cargo package whose version v* and cm-* tags must equal
+        type: string
+        default: ""
+      require_head:
+        description: Refuse unless sha is main's HEAD (vm-runner's release workflows require it)
+        type: boolean
+        default: false
+      dry_run:
+        description: Check and create the tags locally, push nothing
+        type: boolean
+        default: true
+    secrets:
+      DEKOPON_RELEASE_APP_ID:
+        required: true
+      DEKOPON_RELEASE_APP_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cut-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      TAGS: ${{ inputs.tags }}
+      SHA: ${{ inputs.sha }}
+      PACKAGE: ${{ inputs.package }}
+      REQUIRE_HEAD: ${{ inputs.require_head }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      # A tag pushed with GITHUB_TOKEN triggers nothing. The App's installation token is a
+      # different principal, so its push starts the tag-triggered release workflows.
+      - name: Mint a release token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DEKOPON_RELEASE_APP_ID }}
+          private-key: ${{ secrets.DEKOPON_RELEASE_APP_KEY }}
+
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.token.outputs.token }}
+
+      - name: Check the commit and every tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?'
+          head=$(git rev-parse origin/main)
+          sha=$(git rev-parse --verify "${SHA:-$head}^{commit}")
+          git merge-base --is-ancestor "$sha" "$head" || { echo "error: $sha is not on main" >&2; exit 1; }
+          if [[ "$REQUIRE_HEAD" == true && "$sha" != "$head" ]]; then
+            echo "error: $sha is not main's HEAD $head" >&2
+            exit 1
+          fi
+          read -ra tags <<<"$TAGS"
+          (( ${#tags[@]} > 0 )) || { echo "error: no tags given" >&2; exit 1; }
+          git checkout -q --detach "$sha"
+          for tag in "${tags[@]}"; do
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+              echo "error: tag $tag already exists" >&2
+              exit 1
+            fi
+            if [[ "$tag" =~ ^(v|cm-)($semver)$ ]]; then
+              want=${BASH_REMATCH[2]}
+              [[ -n "$PACKAGE" ]] || { echo "error: $tag needs the package input" >&2; exit 1; }
+              have=$(RUSTUP_TOOLCHAIN=stable cargo metadata --no-deps --format-version 1 \
+                | jq -er --arg p "$PACKAGE" '.packages[] | select(.name == $p) | .version')
+            elif [[ "$tag" =~ ^dekopon-chart-($semver)$ ]]; then
+              want=${BASH_REMATCH[1]}
+              have=$(sed -n 's/^version:[[:space:]]*//p' charts/dekopon/Chart.yaml)
+            elif [[ "$tag" =~ ^guest-v$semver$ ]]; then
+              continue
+            else
+              echo "error: $tag is not v*, cm-*, dekopon-chart-* or guest-v* semver" >&2
+              exit 1
+            fi
+            if [[ "$have" != "$want" ]]; then
+              echo "error: $tag names $want but $sha has $have" >&2
+              exit 1
+            fi
+          done
+          echo "SHA_RESOLVED=$sha" >>"$GITHUB_ENV"
+
+      - name: Tag and push atomically
+        shell: bash
+        env:
+          APP_SLUG: ${{ steps.token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          read -ra tags <<<"$TAGS"
+          refs=()
+          for tag in "${tags[@]}"; do
+            git tag -a "$tag" -m "$tag" "$SHA_RESOLVED"
+            [[ "$(git cat-file -t "$tag")" == tag ]]
+            refs+=("refs/tags/$tag")
+          done
+          if [[ "$DRY_RUN" == true ]]; then
+            echo "dry run: would push ${tags[*]} at $SHA_RESOLVED"
+            exit 0
+          fi
+          git push --atomic origin "${refs[@]}"
+          echo "pushed ${tags[*]} at $SHA_RESOLVED"
