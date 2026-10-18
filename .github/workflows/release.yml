@@ -196,7 +196,8 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -f rustflags ]]; then
-            export RUSTFLAGS="$(cat rustflags)"
+            RUSTFLAGS="$(cat rustflags)"
+            export RUSTFLAGS
           fi
           cargo clippy --locked --package "$PKG" --lib --target wasm32-unknown-unknown -- -D warnings
 
