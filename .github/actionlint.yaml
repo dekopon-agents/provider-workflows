@@ -2,3 +2,8 @@ paths:
   .github/workflows/**/*.yml:
     ignore:
       - 'property "workflow_sha" is not defined'
+
+  .github/workflows/size-post.yml:
+    ignore:
+      # GitHub supports the concurrency queue. actionlint 1.7.12 predates it.
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'

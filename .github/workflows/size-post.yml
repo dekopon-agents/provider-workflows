@@ -1,0 +1,58 @@
+name: Post size report
+
+on:
+  workflow_call:
+    inputs:
+      kind:
+        description: Format the size report for core or a provider
+        type: string
+        required: true
+
+jobs:
+  post:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.id == github.event.repository.id &&
+      github.event.workflow_run.actor.login != 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    concurrency:
+      group: size-report-${{ github.event.workflow_run.head_branch }}
+      queue: max
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download this attempt's report
+        id: report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dekopon-size-report-${{ github.event.workflow_run.run_attempt }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/size-report
+
+      - name: Get the poster from this workflow's commit
+        if: steps.report.outcome == 'success'
+        shell: bash
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://raw.githubusercontent.com/dekopon-agents/provider-workflows/$WORKFLOW_SHA/ci/size_report.py" \
+            --output "$RUNNER_TEMP/size_report.py"
+
+      - name: Update the PR's size comment
+        if: steps.report.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          python3 -B "$RUNNER_TEMP/size_report.py" post "$KIND" "$RUNNER_TEMP/size-report/receipt.json"

@@ -33,3 +33,23 @@ jobs:
           tar -xzf "$tarball" actionlint
           shellcheck --version | head -2
           ./actionlint -color -shellcheck shellcheck
+
+  size:
+    name: size counter and report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check out Dekopon history for the baselines
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: dekopon-agents/dekopon
+          path: dekopon-history
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test size reporting
+        env:
+          SIZE_HISTORY_REPO: dekopon-history
+        run: python3 -B -m unittest discover -s ci/tests -v

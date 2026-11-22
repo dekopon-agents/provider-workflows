@@ -1,0 +1,84 @@
+name: Measure size
+
+on:
+  workflow_call:
+    inputs:
+      kind:
+        description: Measure core Rust lines or the provider CI component
+        type: string
+        required: true
+
+jobs:
+  measure:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.id == github.event.repository.id &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
+       github.actor != 'dependabot[bot]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - name: Check out provider-workflows at this workflow's commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: dekopon-agents/provider-workflows
+          ref: ${{ job.workflow_sha }}
+          path: shared
+          persist-credentials: false
+
+      - name: Check out core history
+        if: inputs.kind == 'core'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Name the provider component
+        id: provider
+        if: inputs.kind == 'provider'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=${GITHUB_REPOSITORY#dekopon-agents/dekopon-provider-}
+          [[ "$name" != "$GITHUB_REPOSITORY" ]]
+          echo "asset=$name-provider.wasm" >>"$GITHUB_OUTPUT"
+
+      - name: Download the component from this run
+        if: inputs.kind == 'provider'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ steps.provider.outputs.asset }}
+          path: ${{ runner.temp }}/size-component
+
+      - name: Measure size
+        shell: bash
+        env:
+          KIND: ${{ inputs.kind }}
+          ASSET: ${{ steps.provider.outputs.asset }}
+        run: |
+          set -euo pipefail
+          python3 -B shared/ci/size_report.py measure "$KIND" "$RUNNER_TEMP/receipt.json" \
+            --repo source --component "$RUNNER_TEMP/size-component/$ASSET"
+
+      - name: Upload the PR report
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dekopon-size-report-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the main size receipt
+        if: github.event_name == 'push' && inputs.kind == 'provider'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dekopon-size-receipt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/receipt.json
+          if-no-files-found: error
+          retention-days: 90
