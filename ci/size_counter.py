@@ -262,10 +262,13 @@ def changed_crates(repo, base, head):
         path = next(changes).decode("utf-8", "surrogateescape")
         if kind == b"R100":
             destination = next(changes).decode("utf-8", "surrogateescape")
-            old.pop(path, None)
-            if destination in new:
+            if path in old and destination in new:
+                del old[path]
                 old[destination] = new[destination]
-        elif path in old or path in new:
+                continue
+            if destination in new:
+                changed.add(destination.split("/")[1])
+        if path in old or path in new:
             changed.add(path.split("/")[1])
     before = crate_totals(old)
     after = crate_totals(new)

@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -5,7 +6,7 @@ import sys
 from tempfile import TemporaryDirectory
 import unittest
 
-from ci.size_counter import Lines, SUPPORT, changed_crates, git, snapshots
+from ci.size_counter import Lines, SUPPORT, changed_crates, git, resolve, snapshots
 
 
 HISTORY = os.environ.get("SIZE_HISTORY_REPO")
@@ -90,6 +91,56 @@ class SizeCounterTest(unittest.TestCase):
             changed_crates(self.repo, "HEAD^", "HEAD"),
             {"other": {"base": Lines(0, 10, 0), "head": Lines(0, 11, 0)}},
         )
+
+    def test_rename_into_counted_paths_adds_lines(self):
+        git(self.repo, "mv", "crates/core/examples/check.rs", "crates/core/src/check.rs")
+        self.commit("move example into source")
+
+        self.assertEqual(
+            changed_crates(self.repo, "HEAD^", "HEAD"),
+            {"core": {"base": Lines(3, 9, 0), "head": Lines(4, 9, 0)}},
+        )
+
+    def test_rename_out_of_counted_paths_removes_lines(self):
+        (self.repo / "outside").mkdir()
+        git(self.repo, "mv", "crates/core/src/lib.rs", "outside/lib.rs")
+        self.commit("move source outside crates")
+
+        self.assertEqual(
+            changed_crates(self.repo, "HEAD^", "HEAD"),
+            {"core": {"base": Lines(3, 9, 0), "head": Lines(0, 2, 0)}},
+        )
+
+    def test_core_measure_excludes_base_only_changes_when_pr_is_behind(self):
+        self.write("crates/a/src/lib.rs", b"fn a() {}\n")
+        self.write("crates/b/src/lib.rs", b"fn b() {}\n")
+        self.commit("add two crates")
+        common = resolve(self.repo, "HEAD")
+
+        git(self.repo, "switch", "--quiet", "-c", "fixture-pr")
+        self.write("crates/b/src/lib.rs", b"fn b() {}\nfn pr_line() {}\n")
+        self.commit("add one line in b")
+        head = resolve(self.repo, "HEAD")
+
+        git(self.repo, "switch", "--quiet", "-c", "fixture-base", common)
+        self.write("crates/a/src/lib.rs", b"fn a() {}\n" + b"// base-only line\n" * 500)
+        self.commit("add 500 lines in a")
+        base = resolve(self.repo, "HEAD")
+        git(self.repo, "merge", "--quiet", "--no-edit", head)
+        merge = resolve(self.repo, "HEAD")
+
+        event = self.repo / "pr.json"
+        event.write_text(json.dumps({"pull_request": {"number": 7, "head": {"sha": head}, "base": {"sha": base}}}))
+        receipt = self.repo / "receipt.json"
+        env = dict(os.environ, GITHUB_EVENT_PATH=str(event), GITHUB_EVENT_NAME="pull_request", GITHUB_SHA=merge)
+        subprocess.run(
+            [sys.executable, "-B", str(COUNTER.with_name("size_report.py")),
+             "measure", "core", str(receipt), "--repo", str(self.repo)],
+            env=env, check=True,
+        )
+        report = json.loads(receipt.read_text())
+        self.assertEqual((report["base"], report["head"], report["build"]), (base, head, merge))
+        self.assertEqual(report["metrics"], {"b": {"base": [1, 0, 0], "head": [2, 0, 0]}})
 
 
 @unittest.skipUnless(HISTORY, "set SIZE_HISTORY_REPO to a full read-only Dekopon checkout")

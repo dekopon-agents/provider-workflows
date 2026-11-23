@@ -100,7 +100,7 @@ class SizeReportTest(unittest.TestCase):
         path = self.directory / "receipt.json"
         report = {
             "version": 1, "kind": kind, "number": 7, "head": HEAD, "base": BASE,
-            "build": MERGE if kind == "provider" else HEAD, "metrics": metrics,
+            "build": MERGE, "metrics": metrics,
         }
         path.write_text(json.dumps(report))
         post_report(self.api, self.event, path, kind)
@@ -167,9 +167,20 @@ class SizeReportTest(unittest.TestCase):
     def test_core_comment_carries_each_crates_three_buckets(self):
         self.post({"dekopon-core": {"base": [4, 10, 0], "head": [5, 8, 0]}}, kind="core")
         body = self.api.comments[2]["body"]
+        self.assertIn(f"Core CI measured merge commit {MERGE}.", body)
         self.assertIn("| dekopon-core | Production | 4 | 5 | +1 |", body)
         self.assertIn("| dekopon-core | Test | 10 | 8 | -2 |", body)
         self.assertIn("| dekopon-core | Test support | 0 | 0 | no change |", body)
+
+    def test_workflow_isolates_poster_from_downloaded_artifact(self):
+        workflow = Path(__file__).resolve().parents[2] / ".github/workflows/size-post.yml"
+        definition = workflow.read_text()
+        script = '"$RUNNER_TEMP/size-poster/size_report.py"'
+        artifact = '"$RUNNER_TEMP/size-report/receipt.json"'
+        self.assertIn(f"--output {script}", definition)
+        self.assertIn(f"python3 -I -B {script} select-report", definition)
+        self.assertIn(f'python3 -I -B {script} post "$KIND" {artifact}', definition)
+        self.assertIn("path: ${{ runner.temp }}/size-report\n", definition)
 
     def test_component_counts_embedded_name_payloads(self):
         def section(kind, payload):

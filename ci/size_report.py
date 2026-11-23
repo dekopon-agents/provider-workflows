@@ -86,8 +86,7 @@ def measure(kind, event, build, event_name, repo, component, output):
     if kind == "core":
         from size_counter import changed_crates
 
-        metrics = changed_crates(repo, base, head)
-        build = head
+        metrics = changed_crates(repo, base, build)
     else:
         metrics = component_size(component)
     report = {
@@ -166,7 +165,7 @@ def validate_report(report, kind):
     if kind == "provider":
         if not provider_metrics(metrics):
             raise ValueError("invalid provider size metrics")
-    elif report["build"] != report["head"] or not isinstance(metrics, dict) or any(
+    elif not isinstance(metrics, dict) or any(
         not CRATE.fullmatch(crate)
         or not isinstance(row, dict)
         or row.keys() != {"base", "head"}
@@ -250,7 +249,12 @@ def comment_body(report, baseline):
             after = metrics[key]
             body.append(f"| {label} | {display_base(before)} | {after:,} | {display_delta(before, after)} |")
     else:
-        body.extend(["Tracked Rust lines, excluding examples. Base counts account for exact file moves.", ""])
+        if report["build"] != report["head"]:
+            body.extend([f"Core CI measured merge commit {report['build']}.", ""])
+        body.extend([
+            "Tracked Rust lines, excluding examples. Base counts account for exact moves between counted paths.",
+            "",
+        ])
         if metrics:
             body.extend(["| Crate | Bucket | Base | Head | Delta |", "| --- | --- | ---: | ---: | ---: |"])
             for crate, row in sorted(metrics.items()):

@@ -153,7 +153,7 @@ jobs:
 Same-repository PRs get one reporting-only comment tied to the measured SHA. Forks and Dependabot
 are skipped. Core counts tracked Rust lines under `crates/`, excluding examples. Each line belongs to
 test support, test, or production in that precedence order. Test paths and inline `#[cfg(test)]`
-items contribute test lines. Byte-identical file moves count zero in the PR comparison.
+items contribute test lines. Byte-identical moves between counted paths count zero in the PR comparison.
 
 Providers compare the existing PR CI merge build with the exact base SHA. The comment gives the
 component length and the summed payload size of the custom `name` sections in embedded core modules.

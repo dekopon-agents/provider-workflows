@@ -31,9 +31,10 @@ jobs:
           WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/size-poster"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
             "https://raw.githubusercontent.com/dekopon-agents/provider-workflows/$WORKFLOW_SHA/ci/size_report.py" \
-            --output "$RUNNER_TEMP/size_report.py"
+            --output "$RUNNER_TEMP/size-poster/size_report.py"
 
       - name: Select the latest available report
         id: select
@@ -42,7 +43,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          name=$(python3 -B "$RUNNER_TEMP/size_report.py" select-report)
+          name=$(python3 -I -B "$RUNNER_TEMP/size-poster/size_report.py" select-report)
           printf 'name=%s\n' "$name" >>"$GITHUB_OUTPUT"
 
       - name: Download the selected report
@@ -64,4 +65,4 @@ jobs:
           KIND: ${{ inputs.kind }}
         run: |
           set -euo pipefail
-          python3 -B "$RUNNER_TEMP/size_report.py" post "$KIND" "$RUNNER_TEMP/size-report/receipt.json"
+          python3 -I -B "$RUNNER_TEMP/size-poster/size_report.py" post "$KIND" "$RUNNER_TEMP/size-report/receipt.json"
