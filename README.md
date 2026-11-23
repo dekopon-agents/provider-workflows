@@ -96,6 +96,85 @@ an annotated tag as the dekopon-release App, whose push starts the release workf
 push would not). `require_head: true` additionally refuses anything but `main`'s HEAD. Pushing an
 annotated tag by hand still works.
 
+## PR size reports
+
+For core, add a measure caller at `.github/workflows/size-measure.yml`.
+
+```yaml
+name: Size measure
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    uses: dekopon-agents/provider-workflows/.github/workflows/size-measure.yml@main
+    with:
+      kind: core
+```
+
+For a provider, add this job under `jobs:` in the existing `CI` caller shown above. It reads
+the component artifact from the `ci` job in the same run.
+
+```yaml
+  measure:
+    needs: ci
+    uses: dekopon-agents/provider-workflows/.github/workflows/size-measure.yml@main
+    with:
+      kind: provider
+```
+
+For either repository, add `.github/workflows/size-post.yml` to the default branch. For a provider,
+set `workflows: [CI]` and `kind: provider`.
+
+```yaml
+name: Size report
+
+on:
+  workflow_run:
+    workflows: [Size measure]
+    types: [completed]
+
+jobs:
+  post:
+    permissions:
+      actions: read
+      pull-requests: write
+    uses: dekopon-agents/provider-workflows/.github/workflows/size-post.yml@main
+    with:
+      kind: core
+```
+
+Same-repository PRs get one reporting-only comment tied to the measured SHA. Forks and Dependabot
+are skipped. Core counts tracked Rust lines under `crates/`, excluding examples. Each line belongs to
+test support, test, or production in that precedence order. Test paths and inline `#[cfg(test)]`
+items contribute test lines. Byte-identical moves between counted paths count zero in the PR comparison.
+
+Providers compare the existing PR CI merge build with the exact base SHA. The comment gives the
+component length and the summed payload size of the custom `name` sections in embedded core modules.
+Each main push with a successful component build publishes a separate size receipt for 90 days.
+For adoption, rerun the latest main CI that includes the measure job. If the latest main CI
+predates the caller change, the first main push with the measure job seeds the receipt. Older bases
+with missing or expired receipts read `base unavailable`.
+
+From this repository, print an epoch's `SIZE.md` row in revision, production, test, test support,
+total order.
+
+```sh
+python3 ci/size_counter.py --repo ../dekopon HEAD
+```
+
+The compatibility count uses test paths only and includes examples.
+
+```sh
+python3 ci/size_counter.py --repo ../dekopon --path-method ea5c4730
+```
+
 ## The provider's half of the contract
 
 - `rust-toolchain.toml` — channel, `components`, `targets = ["wasm32-unknown-unknown"]`. The
