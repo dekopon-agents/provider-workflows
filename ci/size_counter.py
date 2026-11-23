@@ -102,6 +102,21 @@ def attribute_open(tokens, index):
     return None
 
 
+def is_const_function(tokens, index):
+    # After const, Rust allows async, item safety, and extern with an optional ABI.
+    following = (token.value for token in tokens[index + 1:index + 6])
+    qualifier = next(following, b"")
+    if qualifier == b"async":
+        qualifier = next(following, b"")
+    if qualifier in {b"safe", b"unsafe"}:
+        qualifier = next(following, b"")
+    if qualifier == b"extern":
+        qualifier = next(following, b"")
+        if qualifier.startswith((b'"', b'r"', b'r#')):
+            qualifier = next(following, b"")
+    return qualifier == b"fn"
+
+
 def item_end(tokens, pairs, start):
     # Braces in generics or a semicolon-terminated item are part of the header/value.
     kind = None
@@ -111,15 +126,8 @@ def item_end(tokens, pairs, start):
     while index < len(tokens):
         value = tokens[index].value
         if value in ITEM and kind is None:
-            kind = value
+            kind = b"fn" if value == b"const" and is_const_function(tokens, index) else value
             semicolon = kind in {b"static", b"type", b"use", b"const"}
-        elif (
-            kind == b"const"
-            and value == b"fn"
-            and tokens[index - 1].value in {b"const", b"unsafe", b"async"}
-        ):
-            semicolon = False
-            kind = b"fn"
         elif value == b"<" and not semicolon:
             angles += 1
         elif value == b">" and angles:

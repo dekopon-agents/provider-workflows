@@ -15,6 +15,7 @@ from zipfile import ZipFile
 MARKER = "<!-- dekopon-size-report -->"
 BOT = "github-actions[bot]"
 DEPENDABOT = "dependabot[bot]"
+REPORT_ARTIFACT = "dekopon-size-report"
 BASE_ARTIFACT = "dekopon-size-receipt"
 MAX_JSON = 256 * 1024
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -176,17 +177,30 @@ def validate_report(report, kind):
         raise ValueError("invalid crate size metrics")
 
 
+def measurement_artifacts(api, run_id, prefix):
+    # The upload is the last measurement step. Partial reruns can leave it in an older attempt.
+    pattern = re.compile(rf"{prefix}-([1-9][0-9]*)")
+    candidates = []
+    for artifact in api.pages(f"/actions/runs/{run_id}/artifacts", "artifacts"):
+        attempt = pattern.fullmatch(artifact["name"])
+        if attempt and not artifact["expired"]:
+            candidates.append((int(attempt[1]), artifact))
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    return [artifact for _, artifact in candidates]
+
+
+def pr_report_name(api, run_id):
+    artifacts = measurement_artifacts(api, run_id, REPORT_ARTIFACT)
+    return artifacts[0]["name"] if artifacts else ""
+
+
 def base_metrics(api, workflow_id, sha):
     path = f"/actions/workflows/{workflow_id}/runs"
-    runs = api.pages(path, "workflow_runs", branch="main", event="push", head_sha=sha, status="success")
+    runs = api.pages(path, "workflow_runs", branch="main", event="push", head_sha=sha)
     for run in runs:
         if run["head_sha"] != sha or run["head_branch"] != "main" or run["event"] != "push":
             continue
-        name = f"{BASE_ARTIFACT}-{run['run_attempt']}"
-        artifacts = api.pages(f"/actions/runs/{run['id']}/artifacts", "artifacts", name=name)
-        for artifact in artifacts:
-            if artifact["expired"] or artifact["name"] != name:
-                continue
+        for artifact in measurement_artifacts(api, run["id"], BASE_ARTIFACT):
             try:
                 archive = api.request(f"/actions/artifacts/{artifact['id']}/zip", archive=True)
             except HTTPError as error:
@@ -262,7 +276,6 @@ def post_report(api, event, path, kind):
     repo_id = event["repository"]["id"]
     if (
         run["event"] != "pull_request"
-        or run["conclusion"] != "success"
         or (run["head_repository"] or {}).get("id") != repo_id
         or run["actor"]["login"] == DEPENDABOT
     ):
@@ -307,11 +320,15 @@ def post_report(api, event, path, kind):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("measure", "post"))
-    parser.add_argument("kind", choices=("core", "provider"))
-    parser.add_argument("artifact", type=Path)
-    parser.add_argument("--repo", type=Path, default=Path("."))
-    parser.add_argument("--component", type=Path)
+    commands = parser.add_subparsers(dest="command", required=True)
+    measure_args = commands.add_parser("measure")
+    post_args = commands.add_parser("post")
+    commands.add_parser("select-report")
+    for command in (measure_args, post_args):
+        command.add_argument("kind", choices=("core", "provider"))
+        command.add_argument("artifact", type=Path)
+    measure_args.add_argument("--repo", type=Path, default=Path("."))
+    measure_args.add_argument("--component", type=Path)
     args = parser.parse_args()
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     if args.command == "measure":
@@ -321,7 +338,10 @@ def main():
         )
     else:
         api = GitHub(os.environ["GITHUB_API_URL"], os.environ["GITHUB_REPOSITORY"], os.environ["GH_TOKEN"])
-        post_report(api, event, args.artifact, args.kind)
+        if args.command == "select-report":
+            print(pr_report_name(api, event["workflow_run"]["id"]))
+        else:
+            post_report(api, event, args.artifact, args.kind)
 
 
 if __name__ == "__main__":

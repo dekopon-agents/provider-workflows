@@ -6,7 +6,8 @@ import unittest
 from zipfile import ZipFile
 
 from ci.size_report import (
-    BASE_ARTIFACT, BOT, COMPONENT, DEPENDABOT, MARKER, MODULE, component_size, post_report,
+    BASE_ARTIFACT, BOT, COMPONENT, DEPENDABOT, MARKER, MODULE, REPORT_ARTIFACT,
+    component_size, post_report, pr_report_name,
 )
 
 
@@ -33,18 +34,23 @@ class FakeGitHub:
         ]
         self.writes = []
         self.runs = [
-            {"id": 3, "run_attempt": 1, "head_sha": OTHER, "head_branch": "main", "event": "push"},
-            {"id": 5, "run_attempt": 2, "head_sha": BASE, "head_branch": "main", "event": "push"},
+            {"id": 3, "run_attempt": 1, "head_sha": OTHER, "head_branch": "main",
+             "event": "push", "conclusion": "success"},
+            {"id": 5, "run_attempt": 2, "head_sha": BASE, "head_branch": "main",
+             "event": "push", "conclusion": "success"},
         ]
         self.artifacts = [{"id": 9, "name": f"{BASE_ARTIFACT}-2", "expired": False}]
+        self.pr_artifacts = []
 
     def pages(self, path, key=None, **params):
         if path == "/actions/workflows/4/runs":
-            assert params == {"branch": "main", "event": "push", "head_sha": BASE, "status": "success"}
-            yield from self.runs
-        elif path == "/actions/runs/5/artifacts":
-            assert params == {"name": f"{BASE_ARTIFACT}-2"}
-            yield from self.artifacts
+            status = params.pop("status", None)
+            assert params == {"branch": "main", "event": "push", "head_sha": BASE}
+            yield from (run for run in self.runs if status is None or run["conclusion"] == status)
+        elif path in {"/actions/runs/5/artifacts", "/actions/runs/6/artifacts"}:
+            name = params.get("name")
+            artifacts = self.artifacts if path == "/actions/runs/5/artifacts" else self.pr_artifacts
+            yield from (artifact for artifact in artifacts if name is None or artifact["name"] == name)
         elif path == "/issues/7/comments":
             yield from self.comments
         else:
@@ -77,6 +83,8 @@ class SizeReportTest(unittest.TestCase):
         self.event = {
             "repository": {"id": 1},
             "workflow_run": {
+                "id": 6,
+                "run_attempt": 1,
                 "event": "pull_request",
                 "conclusion": "success",
                 "head_repository": {"id": 1},
@@ -105,6 +113,29 @@ class SizeReportTest(unittest.TestCase):
                 body = self.api.comments[2]["body"]
                 self.assertIn("| Component bytes | base unavailable | 4,000 | base unavailable |", body)
                 self.assertIn("| Name section bytes | base unavailable | 900 | base unavailable |", body)
+
+    def test_failed_sibling_jobs_keep_pr_report_and_base_receipt(self):
+        self.event["workflow_run"]["conclusion"] = "failure"
+        self.api.runs[1]["conclusion"] = "failure"
+        self.post()
+        self.assertEqual(self.api.writes, ["POST"])
+        self.assertIn("| Component bytes | 4,000 | 4,000 | no change |", self.api.comments[2]["body"])
+
+    def test_partial_rerun_keeps_the_previous_base_receipt(self):
+        self.api.runs[1]["run_attempt"] = 3
+        self.post()
+        self.assertIn("| Component bytes | 4,000 | 4,000 | no change |", self.api.comments[2]["body"])
+
+    def test_partial_rerun_selects_latest_unexpired_pr_report(self):
+        run = self.event["workflow_run"]
+        run["run_attempt"] = 12
+        self.api.pr_artifacts = [
+            {"id": 10, "name": f"{REPORT_ARTIFACT}-9", "expired": False},
+            {"id": 11, "name": f"{REPORT_ARTIFACT}-10", "expired": False},
+            {"id": 12, "name": f"{REPORT_ARTIFACT}-11", "expired": True},
+            {"id": 13, "name": f"{BASE_ARTIFACT}-12", "expired": False},
+        ]
+        self.assertEqual(pr_report_name(self.api, run["id"]), f"{REPORT_ARTIFACT}-10")
 
     def test_sticky_comment_updates_and_zero_means_no_change(self):
         self.post()

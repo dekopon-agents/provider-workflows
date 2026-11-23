@@ -57,6 +57,26 @@ class SizeCounterTest(unittest.TestCase):
         )
         self.assertEqual(sum(files.values(), Lines()).total, 14)
 
+    def test_const_qualifiers_keep_following_production_out_of_test(self):
+        functions = (
+            b'pub const extern "C" fn helper() {}',
+            b'pub const unsafe extern r#"C"# fn helper() {}',
+        )
+        tail = b"\n\npub fn first() {}\n\npub fn second() {}\n"
+        for index, function in enumerate(functions):
+            self.write(f"crates/core/src/qualifiers{index}.rs", b"#[cfg(test)]\n" + function + tail)
+        self.write(
+            "crates/core/src/const_decl.rs",
+            b"#[cfg(test)]\npub const CALLBACK: unsafe fn() = {\n"
+            b"    fn callback() {}\n    callback\n}\n;\n\npub fn production() {}\n",
+        )
+        self.commit("const item boundaries")
+
+        _, files = snapshots(self.repo, "HEAD")
+        for index in range(len(functions)):
+            self.assertEqual(files[f"crates/core/src/qualifiers{index}.rs"], Lines(4, 2, 0))
+        self.assertEqual(files["crates/core/src/const_decl.rs"], Lines(2, 6, 0))
+
     def test_exact_rename_across_crate_and_bucket_counts_zero(self):
         destination = self.repo / "crates/other/tests/moved.rs"
         destination.parent.mkdir(parents=True)
