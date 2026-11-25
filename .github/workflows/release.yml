@@ -2,6 +2,15 @@ name: Provider release
 
 on:
   workflow_call:
+    inputs:
+      name:
+        description: Provider name for the component and other artifacts
+        type: string
+        required: false
+      package:
+        description: Cargo package to build
+        type: string
+        required: false
 
 env:
   # Prebuilt x86_64-linux release tarballs. Bump here and in ci.yml together.
@@ -19,6 +28,9 @@ permissions:
 
 jobs:
   build:
+    env:
+      PROVIDER_NAME_OVERRIDE: ${{ inputs.name }}
+      PROVIDER_PACKAGE_OVERRIDE: ${{ inputs.package }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -31,16 +43,26 @@ jobs:
       prerelease: ${{ steps.tag.outputs.prerelease }}
       sha256: ${{ steps.digest.outputs.sha256 }}
     steps:
-      - name: Name the provider from the repository
+      - name: Resolve the provider name and package
         id: provider
         shell: bash
         run: |
           set -euo pipefail
           name=${GITHUB_REPOSITORY#dekopon-agents/dekopon-provider-}
-          [[ "$name" != "$GITHUB_REPOSITORY" ]]
+          if [[ -n "$PROVIDER_NAME_OVERRIDE" ]]; then
+            name=$PROVIDER_NAME_OVERRIDE
+          elif [[ "$name" == "$GITHUB_REPOSITORY" ]]; then
+            echo "error: set the name input for a repository outside dekopon-agents/dekopon-provider-<name>" >&2
+            exit 1
+          fi
+          package=${PROVIDER_PACKAGE_OVERRIDE:-dekopon-$name-provider}
+          if [[ -n "$PROVIDER_NAME_OVERRIDE$PROVIDER_PACKAGE_OVERRIDE" ]]; then
+            [[ "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "error: invalid provider name" >&2; exit 1; }
+            [[ "$package" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || { echo "error: invalid Cargo package name" >&2; exit 1; }
+          fi
           {
             echo "PROVIDER_NAME=$name"
-            echo "PKG=dekopon-$name-provider"
+            echo "PKG=$package"
             echo "ASSET=$name-provider.wasm"
             echo "SBOM=$name-provider.cdx.json"
           } >>"$GITHUB_ENV"
@@ -203,7 +225,13 @@ jobs:
 
       - name: Build the component
         working-directory: source-a
-        run: ../shared/build.sh
+        shell: bash
+        run: |
+          if [[ -n "$PROVIDER_NAME_OVERRIDE$PROVIDER_PACKAGE_OVERRIDE" ]]; then
+            ../shared/build.sh --name "$PROVIDER_NAME" --package "$PKG"
+          else
+            ../shared/build.sh
+          fi
 
       - name: Verify the checksum sidecar and publish the component path to the tests
         id: digest

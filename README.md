@@ -179,7 +179,7 @@ python3 ci/size_counter.py --repo ../dekopon --path-method ea5c4730
 
 - `rust-toolchain.toml` — channel, `components`, `targets = ["wasm32-unknown-unknown"]`. The
   workflow installs exactly this and exports it as `RUSTUP_TOOLCHAIN`.
-- `Cargo.toml` — exactly one package named `dekopon-<name>-provider`, with its own
+- `Cargo.toml` — the selected provider package, with its own
   `[profile.release]`. That profile is part of the shipped bytes.
 - `deny.toml` — the dependency policy `cargo deny check bans licenses sources advisories` runs.
 - `wit/` — provider-owned WIT dependencies; the provider's `cargo test` runs SDK conformance
@@ -188,7 +188,7 @@ python3 ci/size_counter.py --repo ../dekopon --path-method ea5c4730
 - Tests read the component path from `DEKOPON_PROVIDER_COMPONENT` and must fail (never skip,
   never return early) when it is unset. The workflow exports it after the build.
 
-## Naming, all derived from the repository name
+## Default naming
 
 | Repository | `dekopon-agents/dekopon-provider-<name>` |
 | --- | --- |
@@ -197,7 +197,10 @@ python3 ci/size_counter.py --repo ../dekopon --path-method ea5c4730
 | SBOM | `<name>-provider.cdx.json` |
 | OCI | `ghcr.io/dekopon-agents/provider-<name>` |
 
-The CI check is `ci / validate`.
+The CI check is `ci / validate`. The reusable CI and release workflows accept optional
+`name` and `package` under the caller's `with`. The name sets the artifact and OCI names
+and is required when the repository falls outside the naming convention. If the package
+input is omitted, it defaults to `dekopon-<name>-provider`.
 
 ## Build locally
 
@@ -206,6 +209,11 @@ Clone this repository next to the provider, then from the provider root:
 ```
 ../provider-workflows/build.sh
 ```
+
+Pass `--name NAME` and `--package PACKAGE` for a provider with both names set in the
+workflow. With only `--name`, the package defaults to `dekopon-<name>-provider`.
+With only `--package`, the provider name is inferred from a conventionally named package.
+A positional output path can follow the options.
 
 It needs `rustup`, `jq`, and the `wasm-tools` version `.github/workflows/ci.yml` pins. It writes
 `<name>-provider.wasm` and its `.sha256` into the provider root — the same bytes CI produces.
