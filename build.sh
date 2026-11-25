@@ -12,11 +12,42 @@
 # and version, so it cannot collide, and keeping it means this harness reproduces what the dekopon
 # tree shipped byte for byte when fed the same source. Do not change it casually.
 #
-# Everything provider-specific is read from the provider's checkout, never passed in:
+# Use --name and --package to override the conventional provider and Cargo package names.
+# A positional output path can follow the options. Build settings come from the checkout:
 #   rust-toolchain.toml   the channel (and the sysroot remap string, so bytes match across machines)
-#   Cargo.toml            exactly one package named dekopon-<name>-provider; its [profile.release]
+#   Cargo.toml            the selected package and its [profile.release]
 #   rustflags             optional; wasm-only flags appended to the reproducibility set (turso)
 set -euo pipefail
+
+requested_name=
+requested_package=
+while [[ ${1-} == --name || ${1-} == --package ]]; do
+  if [[ -z ${2-} ]]; then
+    echo "error: $1 requires a value" >&2
+    exit 1
+  fi
+  case $1 in
+    --name)
+      if [[ ! "$2" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+        echo "error: invalid provider name" >&2
+        exit 1
+      fi
+      requested_name=$2
+      ;;
+    --package)
+      if [[ ! "$2" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; then
+        echo "error: invalid Cargo package name" >&2
+        exit 1
+      fi
+      requested_package=$2
+      ;;
+  esac
+  shift 2
+done
+
+if [[ -n "$requested_name" && -z "$requested_package" ]]; then
+  requested_package=dekopon-$requested_name-provider
+fi
 
 root=$PWD
 [[ -f "$root/Cargo.toml" ]] || {
@@ -65,22 +96,35 @@ if [[ "$actual_wasm_tools_version" != "$required_wasm_tools_version" ]]; then
   exit 1
 fi
 
-# Exactly one package is the provider: dekopon-<name>-provider. Everything is named from it.
+# By default, discover the single package named dekopon-<name>-provider.
 # (a while-read loop, not mapfile: macOS ships bash 3.2 and this runs on laptops too)
 provider_packages=()
 while IFS= read -r candidate; do
   provider_packages+=("$candidate")
 done < <(
   rustup run "$rust_toolchain" cargo metadata --locked --no-deps --format-version 1 --manifest-path "$manifest" \
-    | jq -r '.packages[].name | select(test("^dekopon-.+-provider$"))'
+    | jq -r --arg package "$requested_package" '
+        .packages[].name | select(if $package == "" then test("^dekopon-.+-provider$") else . == $package end)
+      '
 )
 if [[ ${#provider_packages[@]} -ne 1 ]]; then
-  echo "error: expected exactly one package named dekopon-<name>-provider, found: ${provider_packages[*]:-none}" >&2
+  if [[ -n "$requested_package" ]]; then
+    echo "error: expected exactly one package named $requested_package, found: ${provider_packages[*]:-none}" >&2
+  else
+    echo "error: expected exactly one package named dekopon-<name>-provider, found: ${provider_packages[*]:-none}" >&2
+  fi
   exit 1
 fi
 package=${provider_packages[0]}
-name=${package#dekopon-}
-name=${name%-provider}
+if [[ -n "$requested_name" ]]; then
+  name=$requested_name
+elif [[ "$package" == dekopon-?*-provider ]]; then
+  name=${package#dekopon-}
+  name=${name%-provider}
+else
+  echo "error: set --name when the package name does not match dekopon-<name>-provider" >&2
+  exit 1
+fi
 core="$target_root/wasm32-unknown-unknown/release/${package//-/_}.wasm"
 component=${1:-"$root/$name-provider.wasm"}
 
